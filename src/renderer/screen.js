@@ -2786,4 +2786,28 @@
             return result;
         };
     }
+
+    // Inject Chain button immediately at startup so it's always visible in the
+    // player controls — don't wait for the first song play.
+    function tryInjectChainButton() {
+        const controls = document.getElementById('player-controls');
+        if (!controls || document.getElementById('btn-chain-switch')) return;
+        const closeBtn = controls.querySelector('button[onclick*="showScreen"]');
+        if (closeBtn && !closeBtn.dataset.chainPanelCloseBound) {
+            closeBtn.addEventListener('click', () => {
+                if (window._closeChainPanel) window._closeChainPanel();
+                if (window._aeLoadDefaultPreset) void window._aeLoadDefaultPreset('player-exit');
+            }, { capture: true });
+            closeBtn.dataset.chainPanelCloseBound = '1';
+        }
+        const btn = document.createElement('button');
+        btn.id = 'btn-chain-switch';
+        btn.className = 'px-3 py-1.5 bg-orange-900/40 hover:bg-orange-900/60 rounded-lg text-xs text-orange-300 transition';
+        btn.textContent = 'Chain';
+        btn.onclick = () => window._toggleChainPanel && window._toggleChainPanel();
+        if (closeBtn) controls.insertBefore(btn, closeBtn);
+        else controls.appendChild(btn);
+    }
+    // Allow app.js to finish initialising before querying the DOM.
+    setTimeout(tryInjectChainButton, 0);
 })();
