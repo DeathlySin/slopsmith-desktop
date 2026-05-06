@@ -288,6 +288,9 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
         deviceManager.getCurrentAudioDevice()->getCurrentSampleRate(),
         deviceManager.getCurrentAudioDevice()->getCurrentBufferSizeSamples());
 
+    noiseGate.prepare(deviceManager.getCurrentAudioDevice()->getCurrentSampleRate(),
+                      deviceManager.getCurrentAudioDevice()->getCurrentBufferSizeSamples());
+
     if (wasRunning) startAudio();
     return true;
 }
@@ -380,6 +383,11 @@ void AudioEngine::resetPeaks()
     outputPeak.store(0.0f);
 }
 
+void AudioEngine::setNoiseGate(bool enabled, float thresholdDb, float releaseMs, float depthDb)
+{
+    noiseGate.setParameters(enabled, thresholdDb, releaseMs, depthDb);
+}
+
 // ── Audio Callback ────────────────────────────────────────────────────────────
 
 void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
@@ -389,6 +397,7 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
 
     signalChain.prepare(currentSampleRate, currentBlockSize);
     pitchDetector.prepare(currentSampleRate, currentBlockSize);
+    noiseGate.prepare(currentSampleRate, currentBlockSize);
 
     const juce::ScopedLock sl(backingLock);
     if (backingTransport)
@@ -444,6 +453,8 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     // Feed pitch detector (before processing so we detect the dry guitar signal)
     if (numOutputChannels > 0)
         pitchDetector.pushSamples(buffer.getReadPointer(0), numSamples);
+
+    noiseGate.processBlock(buffer);
 
     // Process through signal chain (VSTs, NAM, IR)
     bool hasProcessors = signalChain.getNumSlots() > 0;

@@ -118,6 +118,21 @@ export function initAudioBridge(mainWindow: BrowserWindow | null): void {
         return audio?.isMonitorMuted() ?? true;
     });
 
+    ipcMain.handle(
+        'audio:setNoiseGate',
+        (
+            _event,
+            payload: {
+                enabled: boolean;
+                thresholdDb: number;
+                releaseMs: number;
+                depthDb: number;
+            },
+        ) => {
+            audio?.setNoiseGate(payload);
+        },
+    );
+
     // ── Metering ───────────────────────────────────────────────────────────
 
     ipcMain.handle('audio:getLevels', () => {

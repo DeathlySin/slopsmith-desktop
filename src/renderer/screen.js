@@ -53,6 +53,14 @@
     const pitchFreq = $('ae-pitch-freq');
     const pitchCentsBar = $('ae-pitch-cents');
     const savePresetBtn = $('ae-save-preset');
+    const noiseGateEnable = $('ae-noise-gate-enable');
+    const noiseGateThresholdWrap = $('ae-noise-gate-threshold-wrap');
+    const noiseGateThresholdSlider = $('ae-noise-gate-threshold');
+    const noiseGateThresholdLabel = $('ae-noise-gate-threshold-label');
+    const noiseGateReleaseSlider = $('ae-noise-gate-release');
+    const noiseGateReleaseLabel = $('ae-noise-gate-release-label');
+    const noiseGateDepthSlider = $('ae-noise-gate-depth');
+    const noiseGateDepthLabel = $('ae-noise-gate-depth-label');
 
     /** Sliders show dB; `api.setGain` and saved presets use linear amplitude gain (legacy presets unchanged). */
     const GAIN_SLIDER_DB_MIN = -60;
@@ -104,6 +112,147 @@
         } catch { return null; }
     }
 
+    // ── Noise gate (AmpliTube-style: threshold, release ms, depth dB → native setNoiseGate) ──
+    const AE_NOISE_GATE_THRESHOLD_MIN = -96;
+    const AE_NOISE_GATE_THRESHOLD_MAX = 0;
+    const AE_NOISE_GATE_THRESHOLD_DEFAULT = -60;
+    const AE_NOISE_GATE_RELEASE_MIN = 5;
+    const AE_NOISE_GATE_RELEASE_MAX = 2000;
+    const AE_NOISE_GATE_RELEASE_DEFAULT = 100;
+    const AE_NOISE_GATE_DEPTH_MIN = -100;
+    const AE_NOISE_GATE_DEPTH_MAX = 0;
+    const AE_NOISE_GATE_DEPTH_DEFAULT = -60;
+
+    function aeClampNoiseGateThresholdDb(db) {
+        const x = Number(db);
+        const v = Number.isFinite(x) ? x : AE_NOISE_GATE_THRESHOLD_DEFAULT;
+        return Math.min(AE_NOISE_GATE_THRESHOLD_MAX, Math.max(AE_NOISE_GATE_THRESHOLD_MIN, v));
+    }
+
+    function aeClampNoiseGateReleaseMs(ms) {
+        const x = Number(ms);
+        const v = Number.isFinite(x) ? x : AE_NOISE_GATE_RELEASE_DEFAULT;
+        const stepped = Math.round(v / 5) * 5;
+        return Math.min(AE_NOISE_GATE_RELEASE_MAX, Math.max(AE_NOISE_GATE_RELEASE_MIN, stepped));
+    }
+
+    function aeClampNoiseGateDepthDb(db) {
+        const x = Number(db);
+        const v = Number.isFinite(x) ? x : AE_NOISE_GATE_DEPTH_DEFAULT;
+        return Math.min(AE_NOISE_GATE_DEPTH_MAX, Math.max(AE_NOISE_GATE_DEPTH_MIN, v));
+    }
+
+    function aeSyncNoiseGateThresholdLabel() {
+        if (!noiseGateThresholdLabel || !noiseGateThresholdSlider) return;
+        const db = parseFloat(noiseGateThresholdSlider.value);
+        noiseGateThresholdLabel.textContent = (Number.isFinite(db) ? db.toFixed(0) : String(AE_NOISE_GATE_THRESHOLD_DEFAULT)) + ' dB';
+    }
+
+    function aeSyncNoiseGateReleaseLabel() {
+        if (!noiseGateReleaseLabel || !noiseGateReleaseSlider) return;
+        const ms = parseFloat(noiseGateReleaseSlider.value);
+        noiseGateReleaseLabel.textContent = (Number.isFinite(ms) ? String(Math.round(ms)) : String(AE_NOISE_GATE_RELEASE_DEFAULT)) + ' ms';
+    }
+
+    function aeSyncNoiseGateDepthLabel() {
+        if (!noiseGateDepthLabel || !noiseGateDepthSlider) return;
+        const db = parseFloat(noiseGateDepthSlider.value);
+        noiseGateDepthLabel.textContent = (Number.isFinite(db) ? db.toFixed(0) : String(AE_NOISE_GATE_DEPTH_DEFAULT)) + ' dB';
+    }
+
+    function aeSyncNoiseGatePanelVisibility() {
+        if (!noiseGateThresholdWrap || !noiseGateEnable) return;
+        noiseGateThresholdWrap.style.display = noiseGateEnable.checked ? '' : 'none';
+    }
+
+    /** Preset serialization — stored next to inputGain/outputGain on each chain preset. */
+    function captureCurrentNoiseGateState() {
+        return {
+            enabled: !!noiseGateEnable?.checked,
+            thresholdDb: aeClampNoiseGateThresholdDb(
+                parseFloat(noiseGateThresholdSlider?.value ?? String(AE_NOISE_GATE_THRESHOLD_DEFAULT))
+            ),
+            releaseMs: aeClampNoiseGateReleaseMs(
+                parseFloat(noiseGateReleaseSlider?.value ?? String(AE_NOISE_GATE_RELEASE_DEFAULT))
+            ),
+            depthDb: aeClampNoiseGateDepthDb(
+                parseFloat(noiseGateDepthSlider?.value ?? String(AE_NOISE_GATE_DEPTH_DEFAULT))
+            ),
+        };
+    }
+
+    /** Restore gate UI + engine from preset; older presets without `noiseGate` use defaults. */
+    function applyPresetNoiseGate(preset) {
+        const ng = preset && typeof preset.noiseGate === 'object' && preset.noiseGate !== null
+            ? preset.noiseGate
+            : null;
+        const defaults = {
+            enabled: false,
+            thresholdDb: AE_NOISE_GATE_THRESHOLD_DEFAULT,
+            releaseMs: AE_NOISE_GATE_RELEASE_DEFAULT,
+            depthDb: AE_NOISE_GATE_DEPTH_DEFAULT,
+        };
+        const enabled = ng && typeof ng.enabled === 'boolean' ? ng.enabled : defaults.enabled;
+        let thresholdDb = defaults.thresholdDb;
+        let releaseMs = defaults.releaseMs;
+        let depthDb = defaults.depthDb;
+        if (ng) {
+            const t = Number(ng.thresholdDb);
+            if (Number.isFinite(t)) thresholdDb = aeClampNoiseGateThresholdDb(t);
+            const r = Number(ng.releaseMs);
+            if (Number.isFinite(r)) releaseMs = aeClampNoiseGateReleaseMs(r);
+            const d = Number(ng.depthDb);
+            if (Number.isFinite(d)) depthDb = aeClampNoiseGateDepthDb(d);
+        }
+        if (noiseGateEnable) noiseGateEnable.checked = enabled;
+        if (noiseGateThresholdSlider) noiseGateThresholdSlider.value = String(thresholdDb);
+        if (noiseGateReleaseSlider) noiseGateReleaseSlider.value = String(releaseMs);
+        if (noiseGateDepthSlider) noiseGateDepthSlider.value = String(depthDb);
+        aeSyncNoiseGateThresholdLabel();
+        aeSyncNoiseGateReleaseLabel();
+        aeSyncNoiseGateDepthLabel();
+        aeSyncNoiseGatePanelVisibility();
+        aeApplyNoiseGateToEngine();
+    }
+
+    function aeInitNoiseGateUi() {
+        if (noiseGateEnable) noiseGateEnable.checked = false;
+        // Slider defaults match screen.html; no global localStorage — restored per preset via applyPresetNoiseGate.
+        if (noiseGateThresholdSlider) noiseGateThresholdSlider.value = String(AE_NOISE_GATE_THRESHOLD_DEFAULT);
+        if (noiseGateReleaseSlider) noiseGateReleaseSlider.value = String(AE_NOISE_GATE_RELEASE_DEFAULT);
+        if (noiseGateDepthSlider) noiseGateDepthSlider.value = String(AE_NOISE_GATE_DEPTH_DEFAULT);
+        aeSyncNoiseGateThresholdLabel();
+        aeSyncNoiseGateReleaseLabel();
+        aeSyncNoiseGateDepthLabel();
+        aeSyncNoiseGatePanelVisibility();
+    }
+
+    function aeApplyNoiseGateToEngine() {
+        const bridge = window.slopsmithDesktop?.audio;
+        if (!bridge || typeof bridge.setNoiseGate !== 'function') {
+            if (bridge && !window._aeNoiseGateBridgeWarned) {
+                window._aeNoiseGateBridgeWarned = true;
+                console.warn('[audio-engine] audio.setNoiseGate is not available — wire the native engine to enable processing.');
+            }
+            return;
+        }
+        const thresholdDb = aeClampNoiseGateThresholdDb(
+            parseFloat(noiseGateThresholdSlider?.value ?? String(AE_NOISE_GATE_THRESHOLD_DEFAULT))
+        );
+        const releaseMs = aeClampNoiseGateReleaseMs(
+            parseFloat(noiseGateReleaseSlider?.value ?? String(AE_NOISE_GATE_RELEASE_DEFAULT))
+        );
+        const depthDb = aeClampNoiseGateDepthDb(
+            parseFloat(noiseGateDepthSlider?.value ?? String(AE_NOISE_GATE_DEPTH_DEFAULT))
+        );
+        bridge.setNoiseGate({
+            enabled: !!noiseGateEnable?.checked,
+            thresholdDb,
+            releaseMs,
+            depthDb,
+        });
+    }
+
     // ── Init ──────────────────────────────────────────────────────────────────
     async function init() {
         const available = await api.isAvailable();
@@ -119,6 +268,7 @@
         await loadDeviceTypes();
         await refreshChain();
         api.loadPluginList();
+        aeInitNoiseGateUi();
         setupEvents();
         startMetering();
 
@@ -152,6 +302,7 @@
                 toggleBtn.textContent = 'Stop';
                 statusDot.className = 'w-3 h-3 rounded-full bg-emerald-500';
                 statusText.textContent = 'Audio running';
+                aeApplyNoiseGateToEngine();
             }
         }
 
@@ -189,6 +340,8 @@
             }
             if (savedChain.length > 0) await refreshChain();
         }
+
+        aeApplyNoiseGateToEngine();
     }
 
     function saveChainStateFromChain(chain) {
@@ -439,6 +592,7 @@
                 toggleBtn.textContent = 'Stop';
                 statusDot.className = 'w-3 h-3 rounded-full bg-emerald-500';
                 statusText.textContent = 'Audio running';
+                aeApplyNoiseGateToEngine();
             }
         });
 
@@ -470,6 +624,7 @@
                 toggleBtn.textContent = 'Stop';
                 statusDot.className = 'w-3 h-3 rounded-full bg-emerald-500';
                 statusText.textContent = 'Audio running';
+                aeApplyNoiseGateToEngine();
                 saveDeviceSettings();
             } else {
                 statusText.textContent = 'Failed to configure device';
@@ -499,6 +654,32 @@
             api.setGain('output', dbToLinearGain(db));
             outputGainLabel.textContent = formatGainDbLabel(db);
         });
+
+        if (noiseGateEnable) {
+            noiseGateEnable.addEventListener('change', () => {
+                // aeSyncNoiseGatePanelVisibility() internally no-ops when noiseGateThresholdWrap is missing.
+                aeSyncNoiseGatePanelVisibility();
+                aeApplyNoiseGateToEngine();
+            });
+        }
+        if (noiseGateThresholdSlider) {
+            noiseGateThresholdSlider.addEventListener('input', () => {
+                aeSyncNoiseGateThresholdLabel();
+                aeApplyNoiseGateToEngine();
+            });
+        }
+        if (noiseGateReleaseSlider) {
+            noiseGateReleaseSlider.addEventListener('input', () => {
+                aeSyncNoiseGateReleaseLabel();
+                aeApplyNoiseGateToEngine();
+            });
+        }
+        if (noiseGateDepthSlider) {
+            noiseGateDepthSlider.addEventListener('input', () => {
+                aeSyncNoiseGateDepthLabel();
+                aeApplyNoiseGateToEngine();
+            });
+        }
 
         // Add VST
         addVstBtn.addEventListener('click', () => {
@@ -591,8 +772,9 @@
                     name: s.name || '',
                 }));
                 const gains = captureCurrentGainLevels();
+                const noiseGate = captureCurrentNoiseGateState();
                 const presets = getPresets();
-                presets[name] = { nativePreset, items, ...gains, created: Date.now() };
+                presets[name] = { nativePreset, items, ...gains, noiseGate, created: Date.now() };
                 localStorage.setItem('slopsmith-chain-presets', JSON.stringify(presets));
                 wrapper.remove();
                 renderPresetList();
@@ -832,6 +1014,7 @@
                 return false;
             }
             applyPresetGainLevels(preset);
+            applyPresetNoiseGate(preset);
             // Share the single getChainState() result between refreshChain and saveChainState
             // to avoid two back-to-back native bridge round-trips.
             const chain = await refreshChain();
@@ -895,6 +1078,7 @@
 
     window._aeGetPresets = getPresets;
     window._aeApplyPresetGainLevels = applyPresetGainLevels;
+    window._aeApplyPresetNoiseGate = applyPresetNoiseGate;
     window._aeLoadDefaultPreset = loadDefaultPreset;
     window._aeReplaceChainWithPresetBlob = replaceChainWithPresetBlob;
 
@@ -1069,7 +1253,10 @@
 
             this.activeTone = effectiveBase;
             const initialPreset = this.tonePresetMap[effectiveBase];
-            if (initialPreset) applyPresetGainLevels(initialPreset);
+            if (initialPreset) {
+                applyPresetGainLevels(initialPreset);
+                applyPresetNoiseGate(initialPreset);
+            }
             await refreshChain();
             console.log('[tone-switcher] Preloaded tones:', Object.keys(this.toneSlotMap));
         }
@@ -1091,7 +1278,10 @@
             if (changes.length > 0) api.setMultiBypass(changes);
             this.activeTone = toneName;
             const newPreset = this.tonePresetMap[toneName];
-            if (newPreset) applyPresetGainLevels(newPreset);
+            if (newPreset) {
+                applyPresetGainLevels(newPreset);
+                applyPresetNoiseGate(newPreset);
+            }
             console.log('[tone-switcher] Switched to:', toneName);
         }
 
@@ -2399,6 +2589,15 @@
         if (_api?.setGain) { _api.setGain('input', inputLin); _api.setGain('output', outputLin); }
     }
 
+    function applyPresetNoiseGate(_api, preset) {
+        if (window._aeApplyPresetNoiseGate) {
+            window._aeApplyPresetNoiseGate(preset);
+            return;
+        }
+        void _api;
+        void preset;
+    }
+
     window._aeStartToneAutoSwitch = function() { startToneAutoSwitch(); };
     window._aeStopToneMonitor = function() {
         if (_toneMonitor) { clearInterval(_toneMonitor); _toneMonitor = null; }
@@ -2599,7 +2798,10 @@
                     window._toneSwitcher.switchToTone(switchKey);
                     const tpm = window._toneSwitcher.tonePresetMap;
                     const p = tpm && switchKey ? tpm[switchKey] : null;
-                    if (p) applyPresetGainLevels(api, p);
+                    if (p) {
+                        applyPresetGainLevels(api, p);
+                        applyPresetNoiseGate(api, p);
+                    }
                     return;
                 }
                 // Mode changed — reset and re-preload
@@ -2744,7 +2946,10 @@
                 }
 
                 const initialPreset = tonePresetMap[effectiveBase];
-                if (initialPreset) applyPresetGainLevels(api, initialPreset);
+                if (initialPreset) {
+                    applyPresetGainLevels(api, initialPreset);
+                    applyPresetNoiseGate(api, initialPreset);
+                }
 
                 window._toneSwitcher = {
                     activeTone: effectiveBase,
@@ -2761,7 +2966,10 @@
                         if (bypassList.length > 0) api.setMultiBypass(bypassList);
                         this.activeTone = name;
                         const newPreset = this.tonePresetMap?.[name];
-                        if (newPreset) applyPresetGainLevels(api, newPreset);
+                        if (newPreset) {
+                            applyPresetGainLevels(api, newPreset);
+                            applyPresetNoiseGate(api, newPreset);
+                        }
                         console.log('[tone-switcher] Switched to:', name);
                     }
                 };
