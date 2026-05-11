@@ -185,7 +185,7 @@ double AudioEngine::getLatencyMs() const
         int latencySamples = device->getCurrentBufferSizeSamples()
                            + device->getInputLatencyInSamples()
                            + device->getOutputLatencyInSamples();
-        return (latencySamples / currentSampleRate) * 1000.0;
+        return (latencySamples / currentSampleRate.load(std::memory_order_relaxed)) * 1000.0;
     }
     return 0.0;
 }
@@ -242,7 +242,7 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
         }
     }
 
-    bool wasRunning = audioRunning;
+    bool wasRunning = audioRunning.load(std::memory_order_relaxed);
     if (wasRunning) stopAudio();
 
     // Save current device type name before closing
@@ -370,22 +370,24 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
 
     if (auto* configuredDevice = deviceManager.getCurrentAudioDevice())
     {
-        currentSampleRate = configuredDevice->getCurrentSampleRate();
-        currentBlockSize = configuredDevice->getCurrentBufferSizeSamples();
+        const double sr = configuredDevice->getCurrentSampleRate();
+        const int bs = configuredDevice->getCurrentBufferSizeSamples();
+        currentSampleRate.store(sr, std::memory_order_relaxed);
+        currentBlockSize.store(bs, std::memory_order_relaxed);
 
         fprintf(stderr, "[AudioEngine] Device configured OK. Current device: %s\n",
                 configuredDevice->getName().toRawUTF8());
         fprintf(stderr, "[AudioEngine] Actual device setup: sr=%.0f bs=%d (requested bs=%d)\n",
-                currentSampleRate, currentBlockSize, bufferSize);
+                sr, bs, bufferSize);
 
-        signalChain.prepare(currentSampleRate, currentBlockSize);
-        noiseGate.prepare(currentSampleRate, currentBlockSize);
+        signalChain.prepare(sr, bs);
+        noiseGate.prepare(sr, bs);
     }
     else
     {
         fprintf(stderr, "[AudioEngine] Device setup completed but no current device is active\n");
-        currentSampleRate = 0.0;
-        currentBlockSize = 0;
+        currentSampleRate.store(0.0, std::memory_order_relaxed);
+        currentBlockSize.store(0, std::memory_order_relaxed);
         signalChain.releaseResources();
         return false;
     }
@@ -398,18 +400,22 @@ bool AudioEngine::setAudioDevice(const juce::String& inputName, const juce::Stri
 
 void AudioEngine::startAudio()
 {
-    if (audioRunning) { fprintf(stderr, "[AudioEngine] startAudio: already running\n"); return; }
+    if (audioRunning.load(std::memory_order_relaxed))
+    {
+        fprintf(stderr, "[AudioEngine] startAudio: already running\n");
+        return;
+    }
     deviceManager.addAudioCallback(this);
-    audioRunning = true;
-    fprintf(stderr, "[AudioEngine] startAudio: callback added, running=%d, device=%s\n",
-            audioRunning, deviceManager.getCurrentAudioDevice() ? deviceManager.getCurrentAudioDevice()->getName().toRawUTF8() : "none");
+    audioRunning.store(true, std::memory_order_relaxed);
+    fprintf(stderr, "[AudioEngine] startAudio: callback added, running=1, device=%s\n",
+            deviceManager.getCurrentAudioDevice() ? deviceManager.getCurrentAudioDevice()->getName().toRawUTF8() : "none");
 }
 
 void AudioEngine::stopAudio()
 {
-    if (!audioRunning) return;
+    if (!audioRunning.load(std::memory_order_relaxed)) return;
     deviceManager.removeAudioCallback(this);
-    audioRunning = false;
+    audioRunning.store(false, std::memory_order_relaxed);
 }
 
 // ── Backing Track ─────────────────────────────────────────────────────────────
@@ -447,7 +453,8 @@ bool AudioEngine::loadBackingTrack(const juce::File& file)
     backingSource = std::make_unique<juce::AudioFormatReaderSource>(reader, true);
     backingTransport = std::make_unique<juce::AudioTransportSource>();
     backingTransport->setSource(backingSource.get(), 0, nullptr, readerSampleRate);
-    backingTransport->prepareToPlay(currentBlockSize, currentSampleRate);
+    backingTransport->prepareToPlay(currentBlockSize.load(std::memory_order_relaxed),
+                                    currentSampleRate.load(std::memory_order_relaxed));
     cachedBackingDuration.store(backingTransport->getLengthInSeconds());
     cachedBackingPosition.store(0.0);
     std::cerr << "[AudioEngine] loadBackingTrack OK sr=" << readerSampleRate
@@ -507,21 +514,50 @@ void AudioEngine::setNoiseGate(bool enabled, float thresholdDb, float releaseMs,
 
 void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
 {
-    currentSampleRate = device->getCurrentSampleRate();
-    currentBlockSize = device->getCurrentBufferSizeSamples();
+    const double sr = device->getCurrentSampleRate();
+    const int bs = device->getCurrentBufferSizeSamples();
+    currentSampleRate.store(sr, std::memory_order_relaxed);
+    currentBlockSize.store(bs, std::memory_order_relaxed);
 
-    signalChain.prepare(currentSampleRate, currentBlockSize);
-    pitchDetector.prepare(currentSampleRate, currentBlockSize);
-    noiseGate.prepare(currentSampleRate, currentBlockSize);
+    // Reset the input ring buffer so a stop→start cycle delivers a
+    // clean zero-padded cold-start frame instead of mixing in stale
+    // samples from the previous run. Plain relaxed stores are fine —
+    // the audio thread isn't running yet (this is the device-start
+    // hook), so there's no race to worry about here.
+    inputFrameRingWriteIndex.store(0, std::memory_order_relaxed);
+    for (auto& slot : inputFrameRing)
+        slot.store(0.0f, std::memory_order_relaxed);
+
+    // Pre-size the zero-output capture scratch to this device's block
+    // size so the audio thread doesn't allocate when we hit that path.
+    // For the common output > 0 case this storage stays unused.
+    if ((int) inputCaptureScratch.size() < bs)
+        inputCaptureScratch.assign((size_t) bs, 0.0f);
+
+    signalChain.prepare(sr, bs);
+    pitchDetector.prepare(sr, bs);
+    noiseGate.prepare(sr, bs);
 
     const juce::ScopedLock sl(backingLock);
     if (backingTransport)
-        backingTransport->prepareToPlay(currentBlockSize, currentSampleRate);
+        backingTransport->prepareToPlay(bs, sr);
 }
 
 void AudioEngine::audioDeviceStopped()
 {
     signalChain.releaseResources();
+    // Flatten the input ring index on stop so a getInputFrame() call
+    // made between stopAudio() and the next startAudio() returns the
+    // cold-start zero-padded frame rather than stale samples from the
+    // just-finished session.
+    inputFrameRingWriteIndex.store(0, std::memory_order_relaxed);
+    // Track the actual device lifecycle, not just our intent. JUCE
+    // can stop the device externally (hot-unplug, format change, OS
+    // sleep), which fires this callback without going through our
+    // stopAudio() path — leaving audioRunning stuck at true would
+    // keep the audio-bridge's idle gate burning IPC on a dead engine
+    // until the user actually clicked Stop.
+    audioRunning.store(false, std::memory_order_relaxed);
 }
 
 void AudioEngine::audioDeviceIOCallbackWithContext(
@@ -535,24 +571,59 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
     float inGain = inputGain.load();
     int selectedCh = selectedInputChannel.load();
 
-    // Copy input with gain, handling channel selection
+    // Copy input with gain, handling channel selection. Track how
+    // many output channels we've filled so the "zero extras" pass
+    // below can clip to the right range — the broadcast branches
+    // fill all of them, the pass-through branch only fills the
+    // overlap.
+    int filledOutputChannels = 0;
     if (numInputChannels >= 2 && selectedCh >= 0 && selectedCh < numInputChannels)
     {
-        // Single channel mode (e.g., dry from Valeton GP-5 left channel)
+        // Single-channel mode (e.g. dry from Valeton GP-5 left channel).
+        // Broadcast the selected input across all output channels.
         for (int outCh = 0; outCh < numOutputChannels; ++outCh)
             for (int i = 0; i < numSamples; ++i)
                 buffer.setSample(outCh, i, inputData[selectedCh][i] * inGain);
+        filledOutputChannels = numOutputChannels;
+    }
+    else if (selectedCh < 0 && numInputChannels > 1)
+    {
+        // "Both (Mono Mix)": average all input channels and broadcast
+        // the result to every output channel, so the signal chain,
+        // pitch detector, input-frame ring, and the user's monitoring
+        // all see the same mono signal. Previously the else-branch
+        // copied channels through 1:1, which delivered stereo to the
+        // signal chain and to the user even though the UI label
+        // promised a mix; that mismatch surfaced as the renderer's
+        // chord scorer and the engine pitch detector seeing different
+        // audio from what the signal chain/output produced.
+        const float invCh = 1.0f / (float) numInputChannels;
+        for (int i = 0; i < numSamples; ++i)
+        {
+            float mix = 0.0f;
+            for (int ch = 0; ch < numInputChannels; ++ch)
+                mix += inputData[ch][i];
+            const float gained = mix * invCh * inGain;
+            for (int outCh = 0; outCh < numOutputChannels; ++outCh)
+                buffer.setSample(outCh, i, gained);
+        }
+        filledOutputChannels = numOutputChannels;
     }
     else
     {
-        // Normal stereo or mono mix
-        for (int ch = 0; ch < juce::jmin(numInputChannels, numOutputChannels); ++ch)
+        // Pass-through: single-input device, or stereo in/out with no
+        // explicit channel selection and no need to mix.
+        const int passThroughChannels = juce::jmin(numInputChannels, numOutputChannels);
+        for (int ch = 0; ch < passThroughChannels; ++ch)
             for (int i = 0; i < numSamples; ++i)
                 buffer.setSample(ch, i, inputData[ch][i] * inGain);
+        filledOutputChannels = passThroughChannels;
     }
 
-    // Zero extra output channels
-    for (int ch = numInputChannels; ch < numOutputChannels; ++ch)
+    // Zero anything we didn't fill. Previously this was hard-coded to
+    // start at numInputChannels, which on a 2-in/4-out broadcast
+    // config would have wiped the upper two channels we just wrote.
+    for (int ch = filledOutputChannels; ch < numOutputChannels; ++ch)
         buffer.clear(ch, 0, numSamples);
 
     // Metering: input level (pre-processing)
@@ -565,9 +636,68 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         if (peak > prevPeak) inputPeak.store(peak);
     }
 
-    // Feed pitch detector (before processing so we detect the dry guitar signal)
+    // Feed pitch detector and the input-frame ring (before signal-
+    // chain processing, so we detect the dry guitar). In the common
+    // case (numOutputChannels > 0) the channel-copy block above
+    // guarantees buffer channel 0 holds the right post-gain mono
+    // signal for every selection mode, and we read it directly. For
+    // input-only configurations (numOutputChannels == 0, rare but
+    // legal on some ASIO/JACK setups) the output buffer is empty, so
+    // we materialize the same post-gain mono signal from `inputData`
+    // into a pre-sized scratch vector and feed both consumers from
+    // there.
+    const float* monoSource = nullptr;
     if (numOutputChannels > 0)
-        pitchDetector.pushSamples(buffer.getReadPointer(0), numSamples);
+    {
+        monoSource = buffer.getReadPointer(0);
+    }
+    else if (numInputChannels > 0 && (int) inputCaptureScratch.size() >= numSamples)
+    {
+        // Build the mono source mirroring the channel-copy semantics:
+        // explicit channel select picks one input; -1 with multi-input
+        // averages; otherwise input channel 0.
+        if (selectedCh >= 0 && selectedCh < numInputChannels)
+        {
+            for (int i = 0; i < numSamples; ++i)
+                inputCaptureScratch[(size_t) i] = inputData[selectedCh][i] * inGain;
+        }
+        else if (selectedCh < 0 && numInputChannels > 1)
+        {
+            const float invCh = 1.0f / (float) numInputChannels;
+            for (int i = 0; i < numSamples; ++i)
+            {
+                float mix = 0.0f;
+                for (int ch = 0; ch < numInputChannels; ++ch)
+                    mix += inputData[ch][i];
+                inputCaptureScratch[(size_t) i] = mix * invCh * inGain;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < numSamples; ++i)
+                inputCaptureScratch[(size_t) i] = inputData[0][i] * inGain;
+        }
+        monoSource = inputCaptureScratch.data();
+    }
+
+    if (monoSource != nullptr)
+    {
+        pitchDetector.pushSamples(monoSource, numSamples);
+
+        // Mirror the same signal into the lock-free ring buffer that
+        // backs getInputFrame(). The release-store on the write index
+        // pairs with the main-thread reader's acquire load so every
+        // sample written below is visible before the index update.
+        // Per-slot stores are atomic-relaxed so the concurrent read
+        // by getInputFrame() isn't a data race (UB) when the writer
+        // laps mid-snapshot.
+        const uint64_t w = inputFrameRingWriteIndex.load(std::memory_order_relaxed);
+        constexpr int kMask = kInputFrameRingCapacity - 1;
+        for (int i = 0; i < numSamples; ++i)
+            inputFrameRing[(w + (uint64_t) i) & (uint64_t) kMask]
+                .store(monoSource[i], std::memory_order_relaxed);
+        inputFrameRingWriteIndex.store(w + (uint64_t) numSamples, std::memory_order_release);
+    }
 
     noiseGate.processBlock(buffer);
 
@@ -622,4 +752,37 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         float prevPeak = outputPeak.load();
         if (peak > prevPeak) outputPeak.store(peak);
     }
+}
+
+std::vector<float> AudioEngine::getInputFrame(int numSamples) const
+{
+    if (numSamples <= 0) return {};
+    if (numSamples > kInputFrameRingCapacity)
+        numSamples = kInputFrameRingCapacity;
+
+    // Acquire pairs with the audio thread's release store of the write
+    // index: every sample written into the ring before that index is
+    // visible to us here.
+    const uint64_t w = inputFrameRingWriteIndex.load(std::memory_order_acquire);
+    std::vector<float> out((size_t) numSamples, 0.0f);
+
+    // Cold-start: audio thread hasn't filled `numSamples` yet. Return
+    // what we have, zero-padded on the *left* so the most-recent
+    // samples land at the end of the buffer (the YIN/HPS algorithms
+    // expect time-aligned data).
+    if (w < (uint64_t) numSamples)
+    {
+        const size_t available = (size_t) w;
+        for (size_t i = 0; i < available; ++i)
+            out[(size_t) numSamples - available + i]
+                = inputFrameRing[i].load(std::memory_order_relaxed);
+        return out;
+    }
+
+    constexpr uint64_t kMask = (uint64_t) kInputFrameRingCapacity - 1;
+    const uint64_t start = w - (uint64_t) numSamples;
+    for (int i = 0; i < numSamples; ++i)
+        out[(size_t) i]
+            = inputFrameRing[(start + (uint64_t) i) & kMask].load(std::memory_order_relaxed);
+    return out;
 }
