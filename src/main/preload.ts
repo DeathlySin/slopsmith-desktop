@@ -6,15 +6,57 @@ const { contextBridge, ipcRenderer } = require('electron');
 import type { StartupStatus } from './python';
 import { IPC_STARTUP_STATUS, IPC_STARTUP_GET_STATUS, IPC_STARTUP_REQUEST_STATUS } from './ipc-channels';
 
-// Ref count of active `audio:inputFrame` listeners installed via
-// `slopsmithDesktop.audio.onInputFrame`. Used to deduplicate the
-// per-renderer subscribe/unsubscribe IPC so the main process sees one
-// subscribe on the first listener and one unsubscribe when the last
-// goes away.
-let inputFrameListenerCount = 0;
-
 // Audio sync offset — set as a mutable property via the isolated world bridge.
 // The settings panel reads/writes localStorage and updates this at runtime.
+
+// Polyphonic chord-scoring request/response contract. Mirrors the C++
+// ChordScorer::Request / Result structs and the JS _ndScoreChord
+// payload — kept in sync by hand since N-API doesn't generate
+// bindings. Optional `mt` field on Note isn't read by the scorer
+// (matches JS) but is allowed in the request shape so callers can
+// pass through the same chart-note objects they consume in JS.
+export interface ChordScoreNote {
+    s: number;   // 0-based string index
+    f: number;   // fret
+    mt?: number; // mute flag (ignored by scorer)
+    ho?: boolean; // hammer-on
+    po?: boolean; // pull-off
+    b?: boolean;  // bend
+    sl?: boolean; // slide
+    hm?: boolean; // harmonic (energy-only check)
+}
+export interface ChordScoreRequest {
+    // arrangement and stringCount are optional on the wire — the
+    // native parser defaults them to 'guitar' / 6 when omitted, so a
+    // request that supplies six standard-tuning offsets and notes
+    // can leave them out entirely. They become effectively required
+    // only when you want to score a non-default tuning (any bass
+    // arrangement, or a 7/8-string guitar), since `offsets.length`
+    // must equal `stringCount` for the scorer's validation to pass.
+    arrangement?: 'guitar' | 'bass';
+    stringCount?: number;
+    offsets: number[];        // tuning offsets, length must equal stringCount (default 6)
+    capo?: number;
+    pitchCheckCents?: number; // 0 = energy-only chord check
+    minHitRatio?: number;
+    numSamples?: number;      // override the 4096 default window
+    notes: ChordScoreNote[];
+}
+export interface ChordScoreNoteResult {
+    s: number;
+    f: number;
+    hit: boolean;
+    bandEnergy: number;
+    centsDiff: number | null;
+    centsError: number | null;
+}
+export interface ChordScoreResult {
+    score: number;
+    hitStrings: number;
+    totalStrings: number;
+    isHit: boolean;
+    results: ChordScoreNoteResult[];
+}
 
 contextBridge.exposeInMainWorld('slopsmithDesktop', {
     // Platform detection
@@ -65,43 +107,16 @@ contextBridge.exposeInMainWorld('slopsmithDesktop', {
         // AudioContext to read it from). Queried once at startAudio.
         getSampleRate: (): Promise<number> => ipcRenderer.invoke('audio:getSampleRate'),
 
-        // Raw input frame stream — pushed every ~50ms from the audio
-        // engine's lock-free ring buffer. Used by notedetect's
-        // polyphonic chord scorer (`_ndScoreChord`), which needs the
-        // actual audio samples rather than a derived metric.
-        //
-        // Returns an unsubscribe closure. Listeners are ref-counted at
-        // this preload boundary: the first one triggers an IPC
-        // `subscribe`, the last unsubscribe triggers `unsubscribe`.
-        // The main process treats this renderer as a single subscriber
-        // regardless of how many in-renderer listeners we have, so we
-        // can't just forward each install/uninstall as a sub/unsub.
-        onInputFrame: (
-            callback: (frame: { samples: Float32Array; seq: number }) => void,
-        ): (() => void) => {
-            const listener = (
-                _event: unknown,
-                frame: { samples: Float32Array; seq: number },
-            ) => callback(frame);
-            ipcRenderer.on('audio:inputFrame', listener);
-            inputFrameListenerCount += 1;
-            if (inputFrameListenerCount === 1) {
-                ipcRenderer.send('audio:subscribeInputFrames');
-            }
-            // Idempotent unsubscribe — calling twice on the same handle
-            // must NOT double-decrement the ref-count, or we'd send a
-            // stray `unsubscribe` while other listeners are still live.
-            let removed = false;
-            return () => {
-                if (removed) return;
-                removed = true;
-                ipcRenderer.removeListener('audio:inputFrame', listener);
-                inputFrameListenerCount -= 1;
-                if (inputFrameListenerCount === 0) {
-                    ipcRenderer.send('audio:unsubscribeInputFrames');
-                }
-            };
-        },
+        // Polyphonic chord scoring — native ChordScorer in the audio
+        // engine evaluates the chord context against the most recent
+        // input-ring samples and returns the same
+        // `{ score, hitStrings, totalStrings, isHit, results[] }` shape
+        // the in-renderer `_ndScoreChord` produces. No audio buffers
+        // cross IPC; only the small result object does. Returns `null`
+        // on a downlevel addon that predates ChordScorer so the caller
+        // can fall back gracefully.
+        scoreChord: (ctx: ChordScoreRequest): Promise<ChordScoreResult | null> =>
+            ipcRenderer.invoke('audio:scoreChord', ctx),
 
         // VST plugins
         scanPlugins: (dirs?: string[]) => ipcRenderer.invoke('audio:scanPlugins', dirs),

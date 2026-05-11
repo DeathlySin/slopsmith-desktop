@@ -1,5 +1,7 @@
 #include "AudioEngine.h"
 
+#include <cmath>
+
 // On Windows, ASIO drivers can crash with access violations.
 // We catch C++ exceptions but can't easily catch SEH in functions with dtors.
 // The try/catch blocks around device operations are the best we can do
@@ -752,6 +754,51 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
         float prevPeak = outputPeak.load();
         if (peak > prevPeak) outputPeak.store(peak);
     }
+}
+
+ChordScorer::Result AudioEngine::scoreChord(const ChordScorer::Request& req)
+{
+    // Fast-path when the device isn't running — the input ring is
+    // zeroed in audioDeviceStopped() (and stays at zero between init
+    // and the first device start), so any FFT we ran here would just
+    // produce an all-miss score against a silence buffer. Skip the
+    // ring snapshot + FFT and synthesize the same shape directly.
+    // Keeps a renderer that polls scoreChord during a transport stop
+    // from spending main-thread CPU on a known-no-op call.
+    if (! audioRunning.load(std::memory_order_relaxed))
+    {
+        ChordScorer::Result out{};
+        out.totalStrings = (int) req.notes.size();
+        out.results.reserve(req.notes.size());
+        for (const auto& n : req.notes)
+        {
+            ChordScorer::NoteResult r{};
+            r.string = n.string;
+            r.fret = n.fret;
+            out.results.push_back(r);
+        }
+        return out;
+    }
+
+    // Snapshot the input ring at the requested window size and forward
+    // to the scorer. The renderer never sees audio data — only the
+    // result object — which is the whole point of running the scoring
+    // here rather than over an audio-frame IPC.
+    const int numSamples = (req.numSamples > 0) ? req.numSamples : 4096;
+    auto frame = getInputFrame(numSamples);
+    // currentSampleRate is 0 between init() and the first
+    // audioDeviceAboutToStart, and can also drop to 0 after a device
+    // teardown. ChordScorer would still return a well-shaped all-miss
+    // result in that case (see its `numSamples <= 0 || sampleRate <= 0`
+    // fail-closed path), so this fallback isn't load-bearing for the
+    // result shape — but a 48 kHz floor lets the scorer actually run
+    // the FFT against whatever stale audio is still in the ring,
+    // giving the renderer a real score during the small window between
+    // device-stop and the next audioRunning=false observation.
+    // Mirrors NodeAddon::GetSampleRate's 48 kHz floor.
+    double sr = currentSampleRate.load(std::memory_order_relaxed);
+    if (! std::isfinite(sr) || sr <= 0.0) sr = 48000.0;
+    return chordScorer.scoreChord(frame.data(), (int) frame.size(), sr, req);
 }
 
 std::vector<float> AudioEngine::getInputFrame(int numSamples) const
