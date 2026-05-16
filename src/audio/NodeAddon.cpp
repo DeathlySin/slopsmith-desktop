@@ -6,7 +6,14 @@
 #include <thread>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <cmath>
+#include <string>
+#if defined(_WIN32)
+ #include <io.h>      // _dup2, _fileno
+#else
+ #include <unistd.h>  // dup2, fileno
+#endif
 
 #include "AudioEngine.h"
 #include "VSTHost.h"
@@ -1461,6 +1468,60 @@ static Napi::Value SetMultiBypass(const Napi::CallbackInfo& info)
     return Napi::Boolean::New(env, true);
 }
 
+// ── Debug file logging ────────────────────────────────────────────────────────
+
+// Redirect the process's stderr to a file so the native [AudioEngine] /
+// [audio-native] diagnostics are captured for a bug report on machines with
+// no console (packaged Windows builds). Only invoked when SLOPSMITH_DEBUG is
+// set.
+//
+// The file is opened FIRST; only on success is its fd dup2'd onto stderr.
+// freopen() would close stderr before trying the new path, so a failed open
+// would leave stderr closed and silently swallow every later diagnostic — the
+// open-then-dup2 order keeps stderr intact on failure. Append mode so the JS
+// layer's header + early lines survive; unbuffered so a crash leaves a
+// complete tail.
+static Napi::Value EnableFileLogging(const Napi::CallbackInfo& info)
+{
+    auto env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString())
+    {
+        Napi::TypeError::New(env, "enableFileLogging(path) requires a string")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+#if defined(_WIN32)
+    // Widen via UTF-16 so a profile path with non-ASCII characters isn't
+    // mangled by the ANSI codepage (same rationale as VSTTrace.h).
+    const std::u16string u16 = info[0].As<Napi::String>().Utf16Value();
+    FILE* f = _wfopen(reinterpret_cast<const wchar_t*>(u16.c_str()), L"a");
+#else
+    const std::string path = info[0].As<Napi::String>().Utf8Value();
+    FILE* f = std::fopen(path.c_str(), "a");
+#endif
+    if (f == nullptr)
+        return Napi::Boolean::New(env, false);  // stderr left untouched
+
+    std::fflush(stderr);
+#if defined(_WIN32)
+    const int rc = _dup2(_fileno(f), _fileno(stderr));
+#else
+    const int rc = dup2(fileno(f), fileno(stderr));
+#endif
+    // fd 2 now shares the file's open description; the extra FILE* is no
+    // longer needed (closing it does not touch the dup'd fd 2).
+    std::fclose(f);
+    if (rc == -1)
+        return Napi::Boolean::New(env, false);  // dup2 failed, stderr intact
+
+    // Unbuffered: each [AudioEngine] fprintf hits disk immediately, so a
+    // crash mid-reconfigure still leaves the diagnostic line that explains it.
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::fprintf(stderr, "[audio-native] file logging enabled\n");
+    return Napi::Boolean::New(env, true);
+}
+
 // ── Module Registration ───────────────────────────────────────────────────────
 
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
@@ -1468,6 +1529,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports)
     // Lifecycle
     exports.Set("init", Napi::Function::New(env, Init));
     exports.Set("shutdown", Napi::Function::New(env, Shutdown));
+    exports.Set("enableFileLogging", Napi::Function::New(env, EnableFileLogging));
 
     // Devices
     exports.Set("getDeviceTypes", Napi::Function::New(env, GetDeviceTypes));
