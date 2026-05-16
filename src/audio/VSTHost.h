@@ -28,6 +28,20 @@ public:
     };
     juce::Array<PluginInfo> getKnownPlugins() const;
 
+    // Scan a single plugin file in-process and return its PluginDescriptions
+    // serialised as XML (root <PLUGINS>, one child element per description;
+    // <PLUGINS/> when the file yields nothing). Used by slopsmith-vst-host's
+    // --scan-plugin subprocess mode so a crashy plugin can't take the app down.
+    juce::String scanPluginFileToXml(const juce::String& path);
+
+    // Merge PluginDescriptions from XML produced by scanPluginFileToXml (in a
+    // child process) into the known-plugins list. Returns false if the XML
+    // could not be parsed as a <PLUGINS> document (a child that exited 0 but
+    // emitted garbage) — the caller treats that as a failed probe rather than
+    // silently counting the plugin as scanned. A valid but empty <PLUGINS/>
+    // returns true (the file genuinely yielded no descriptors).
+    bool addPluginsFromXml(const juce::String& xml);
+
     // Load a plugin instance
     std::unique_ptr<juce::AudioPluginInstance> loadPlugin(
         const juce::String& fileOrIdentifier,
