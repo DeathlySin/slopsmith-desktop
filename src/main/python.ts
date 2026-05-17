@@ -14,6 +14,15 @@ import { isDebugEnabled } from './debug-log';
 let pythonProcess: ChildProcess | null = null;
 let serverPort = 18000; // Use 18000+ to avoid conflicting with Docker Slopsmith on 8000
 let serverReady = false;
+// Set by startPython when the backend cannot even be spawned (e.g. server.py
+// missing). waitForPython checks this so a config error fails fast with a
+// specific message instead of running out the full readiness timeout.
+let startupError: string | null = null;
+// True once waitForPython has confirmed the server with a successful HTTP
+// probe. Until then, any child exit is a startup failure — serverReady
+// alone is not enough, since the child can log "startup complete" and then
+// exit before the probe succeeds.
+let startupComplete = false;
 
 export function getPythonPort(): number {
     return serverPort;
@@ -126,12 +135,38 @@ function findSlopsmithDir(): string {
         return path.join(process.resourcesPath, 'slopsmith');
     }
 
-    // Development: use the local slopsmith repo
-    const devPath = path.join(process.env.HOME || '', 'Repositories', 'slopsmith');
-    if (fs.existsSync(devPath)) return devPath;
+    // Development — same resolution order as scripts/setup-dev.sh:
+    //   1. $SLOPSMITH_DIR
+    //   2. ../slopsmith (sibling to slopsmith-desktop)
+    //   3. ~/Repositories/slopsmith (legacy)
+    // An explicit $SLOPSMITH_DIR is honoured verbatim — never fall through
+    // to a sibling/legacy checkout, so a typo or partial checkout surfaces
+    // as a clear "server.py not found" error in startPython instead of
+    // silently starting a different Slopsmith. Matches the build scripts
+    // (bundle-python.sh, build-macos.sh). For the unset case a fallback
+    // candidate only counts if it actually contains server.py, so a partial
+    // or unrelated ../slopsmith directory cannot mask a valid legacy
+    // checkout.
+    const isSlopsmithRepo = (dir: string): boolean =>
+        fs.existsSync(path.join(dir, 'server.py'));
 
-    // Fallback: assume it's next to this repo
-    return path.join(__dirname, '..', '..', '..', 'slopsmith');
+    // $SLOPSMITH_DIR must be a native path. On Windows, pass a native path
+    // (C:\\src\\slopsmith), not an MSYS/Git-Bash path (/c/src/slopsmith) —
+    // Node resolves the latter against the current drive root. See README.
+    const explicit = process.env.SLOPSMITH_DIR;
+    if (explicit) return path.resolve(explicit);
+
+    const siblingPath = path.join(__dirname, '..', '..', '..', 'slopsmith');
+    if (isSlopsmithRepo(siblingPath)) return siblingPath;
+
+    // app.getPath('home') is the platform-native home (USERPROFILE on
+    // Windows, HOME on POSIX). process.env.HOME is an MSYS-style path such
+    // as /c/Users/name when Electron is launched from Git Bash, which Node
+    // misresolves — see the cacheBase comment in startPython.
+    const legacyPath = path.join(app.getPath('home'), 'Repositories', 'slopsmith');
+    if (isSlopsmithRepo(legacyPath)) return legacyPath;
+
+    return siblingPath;
 }
 
 function getConfigDir(): string {
@@ -181,12 +216,20 @@ function getDLCDir(): string {
 }
 
 export async function startPython(): Promise<void> {
+    startupError = null;
+    startupComplete = false;
     const slopsmithDir = findSlopsmithDir();
     const serverScript = path.join(slopsmithDir, 'server.py');
 
     if (!fs.existsSync(serverScript)) {
-        console.error(`[python] server.py not found at ${serverScript}`);
-        console.error('[python] Make sure slopsmith is available at ~/Repositories/slopsmith/');
+        // findSlopsmithDir returns a bundled path when packaged and ignores
+        // SLOPSMITH_DIR there — so the remediation differs by mode.
+        startupError = `Slopsmith server.py not found at ${serverScript}. `
+            + (app.isPackaged
+                ? 'The application bundle is incomplete or corrupt — reinstall Slopsmith Desktop.'
+                : 'Set SLOPSMITH_DIR to your Slopsmith checkout, clone it to ../slopsmith, '
+                  + 'or use ~/Repositories/slopsmith/.');
+        console.error(`[python] ${startupError}`);
         return;
     }
 
@@ -328,7 +371,7 @@ export async function startPython(): Promise<void> {
         }
     }
 
-    pythonProcess = spawn(pythonPath, [
+    const child = spawn(pythonPath, [
         '-m', 'uvicorn', 'server:app',
         '--host', '127.0.0.1',
         '--port', String(serverPort),
@@ -338,6 +381,7 @@ export async function startPython(): Promise<void> {
         env: pythonEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
     });
+    pythonProcess = child;
 
     // Flip `serverReady` when uvicorn emits a startup signal on either
     // stdout or stderr. structlog routes these messages to stdout in dev
@@ -348,7 +392,7 @@ export async function startPython(): Promise<void> {
         }
     }
 
-    pythonProcess.stdout?.on('data', (data: Buffer) => {
+    child.stdout?.on('data', (data: Buffer) => {
         try {
             const msg = data.toString().trim();
             if (msg) {
@@ -360,9 +404,9 @@ export async function startPython(): Promise<void> {
 
     // Swallow stream errors — EPIPE fires when the Python child dies while
     // we're still draining its pipes; that's expected, not a bug.
-    pythonProcess.stdout?.on('error', () => { /* ignore */ });
+    child.stdout?.on('error', () => { /* ignore */ });
 
-    pythonProcess.stderr?.on('data', (data: Buffer) => {
+    child.stderr?.on('data', (data: Buffer) => {
         try {
             const msg = data.toString().trim();
             if (msg) {
@@ -372,16 +416,39 @@ export async function startPython(): Promise<void> {
         } catch { /* EPIPE or similar when the process dies mid-write */ }
     });
 
-    pythonProcess.stderr?.on('error', () => { /* ignore */ });
+    child.stderr?.on('error', () => { /* ignore */ });
 
-    pythonProcess.on('close', (code: number | null) => {
-        console.log(`[python] Process exited with code ${code}`);
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+        // Ignore events from a child that restartPython has already
+        // replaced — a stale 'close' must not null out the new process
+        // or fail its startup.
+        if (pythonProcess !== child) return;
+        // On a signal exit Node reports code === null; surface the signal
+        // so the cause (SIGKILL/OOM, SIGTERM, ...) is not lost.
+        const exitDesc = code !== null ? `code ${code}` : `signal ${signal ?? 'unknown'}`;
+        console.log(`[python] Process exited with ${exitDesc}`);
+        // If the child exits before waitForPython confirmed the server
+        // (HTTP probe), record a startupError so waitForPython fails fast
+        // instead of polling out the full timeout. serverReady alone is not
+        // enough — the child can log "startup complete" then exit before
+        // the probe succeeds. startupComplete === true means startup already
+        // succeeded (a later crash is not a startup failure).
+        if (!startupComplete && !startupError) {
+            startupError = `Python process exited before startup completed (${exitDesc}).`;
+        }
         pythonProcess = null;
         serverReady = false;
     });
 
-    pythonProcess.on('error', (err: Error) => {
+    child.on('error', (err: Error) => {
+        // Ignore errors from a child restartPython has already replaced.
+        if (pythonProcess !== child) return;
         console.error(`[python] Failed to start: ${err.message}`);
+        // spawn itself failed (e.g. interpreter not found) — surface it to
+        // waitForPython rather than waiting out the readiness timeout.
+        if (!startupError) {
+            startupError = `Failed to start Python process: ${err.message}`;
+        }
         pythonProcess = null;
     });
 }
@@ -410,6 +477,10 @@ export async function waitForPython(): Promise<number> {
     const maxAttempts = 600; // 5 minutes
     const intervalMs = 500;
     for (let i = 0; i < maxAttempts; i++) {
+        // Fail fast on a config error startPython already diagnosed (e.g.
+        // server.py missing) rather than waiting out the whole timeout.
+        if (startupError) throw new Error(startupError);
+
         if (serverReady) {
             const ok = await new Promise<boolean>((resolve) => {
                 const req = http.get(`http://127.0.0.1:${serverPort}/api/plugins`, (res) => {
@@ -418,7 +489,10 @@ export async function waitForPython(): Promise<number> {
                 req.on('error', () => resolve(false));
                 req.setTimeout(2000, () => { req.destroy(); resolve(false); });
             });
-            if (ok) return serverPort;
+            if (ok) {
+                startupComplete = true;
+                return serverPort;
+            }
             // serverReady was set but HTTP probe failed — fall through
             // and retry (lifespan-complete may briefly precede socket
             // accept on slow machines).
@@ -450,22 +524,41 @@ export async function getStartupStatus(): Promise<StartupStatus | null> {
 }
 
 export function stopPython(): void {
-    if (!pythonProcess) return;
+    // Capture the child being stopped. During restartPython the global
+    // pythonProcess may already point at a new child by the time the
+    // force-kill timer fires — SIGTERM/SIGKILL must hit the one being
+    // stopped, never the replacement.
+    const proc = pythonProcess;
+    if (!proc) return;
 
     console.log('[python] Stopping server...');
 
+    // The stop is intentional, so detach this child from module state now:
+    //   - pythonProcess = null makes proc's own 'close'/'error' handlers
+    //     no-op (their `pythonProcess !== child` guard), so the expected
+    //     shutdown exit can't be recorded as a startup failure;
+    //   - clearing the startup flags means a restart (and any later
+    //     waitForPython) starts from a clean slate rather than throwing a
+    //     stale startupError left by the stopped child.
+    pythonProcess = null;
+    startupError = null;
+    startupComplete = false;
+    serverReady = false;
+
     // Try graceful shutdown first
-    pythonProcess.kill('SIGTERM');
+    let exited = false;
+    proc.kill('SIGTERM');
 
     // Force kill after timeout
     const killTimeout = setTimeout(() => {
-        if (pythonProcess) {
+        if (!exited) {
             console.log('[python] Force killing...');
-            pythonProcess.kill('SIGKILL');
+            proc.kill('SIGKILL');
         }
     }, 5000);
 
-    pythonProcess.on('close', () => {
+    proc.once('close', () => {
+        exited = true;
         clearTimeout(killTimeout);
     });
 }

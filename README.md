@@ -70,23 +70,42 @@ yet ship an auto-updater; check Releases periodically for new versions.
 - Python 3.12+
 - CMake 3.22+
 - Git
-- [Slopsmith](https://github.com/byrongamatos/slopsmith) cloned at `../slopsmith/` (preferred) or `~/Repositories/slopsmith/`
+- [Slopsmith](https://github.com/byrongamatos/slopsmith) — resolved in this order:
+  1. `$SLOPSMITH_DIR` env var
+  2. `../slopsmith/` (sibling clone, recommended)
+  3. `~/Repositories/slopsmith/` (legacy)
+
+  An explicit `$SLOPSMITH_DIR` is used verbatim — if it is wrong, startup
+  fails with a clear error rather than falling back. On Windows, set it to a
+  native path (`C:\src\slopsmith`), not an MSYS/Git-Bash path
+  (`/c/src/slopsmith`), which Node resolves against the current drive root.
 
 **Linux:**
 ```bash
 # Ubuntu/Debian
 sudo apt install libasound2-dev libjack-jackd2-dev libfreetype-dev \
-  libx11-dev libxrandr-dev libxcursor-dev libxinerama-dev pkg-config cmake
+  libx11-dev libxrandr-dev libxcursor-dev libxinerama-dev pkg-config cmake \
+  ffmpeg
+# vgmstream-cli is not in the apt repos — install a prebuilt binary from
+# https://github.com/vgmstream/vgmstream/releases (download the Linux CLI
+# artifact and place vgmstream-cli on your PATH).
 
 # Arch/Manjaro
-sudo pacman -S alsa-lib jack2 freetype2 libx11 libxrandr libxcursor libxinerama cmake
+sudo pacman -S alsa-lib jack2 freetype2 libx11 libxrandr libxcursor libxinerama pkgconf cmake ffmpeg
+yay -S vgmstream-cli-bin
 ```
 
 **macOS:**
 ```bash
 xcode-select --install
-brew install cmake pkg-config
+brew install cmake pkg-config ffmpeg vgmstream
 ```
+
+> **Note:** Homebrew's `ffmpeg` 8.1.1+ no longer enables the `libvorbis`
+> encoder. Dev mode still runs — Sloppak conversion falls back to ffmpeg's
+> lower-quality built-in vorbis encoder — but packaged macOS builds bundle a
+> static ffmpeg with `--enable-libvorbis` for full-quality `.ogg` output.
+> `setup-dev.sh` prints a `[WARN]` when the encoder is absent.
 
 ### Build
 
@@ -124,8 +143,11 @@ inside the DevContainer:
 
 **Prerequisites**
 - [Docker](https://docs.docker.com/get-docker/)
-- The [Slopsmith](https://github.com/byrongamatos/slopsmith) server
-  repository cloned at `../slopsmith/`
+- The [Slopsmith](https://github.com/byrongamatos/slopsmith) server repository
+  cloned as a sibling at `../slopsmith`. The DevContainer bind-mounts that exact
+  path (`.devcontainer/devcontainer.json`) and its `postCreateCommand` fails
+  fast if it is missing — unlike the host build, it does **not** honour
+  `$SLOPSMITH_DIR` or `~/Repositories/slopsmith`.
 
 **VS Code**
 ```bash
@@ -177,12 +199,34 @@ All Slopsmith plugins work in the desktop app. The embedded Python server runs t
 
 ### Installing Plugins
 
-Use the Plugin Manager (Plugins tab) or manually:
+Use the Plugin Manager (Plugins tab) or manually. The plugins directory varies by platform:
+
+| Platform | Plugins directory |
+|----------|-------------------|
+| macOS    | `~/Library/Application Support/slopsmith-desktop/plugins/` |
+| Linux    | `~/.config/slopsmith-desktop/plugins/` |
+| Windows  | `%APPDATA%\slopsmith-desktop\plugins\` |
+
+Clone directly into the plugins directory, or symlink a repo from elsewhere (symlinks are followed).
+
+**macOS:**
 ```bash
-cd ~/.config/slopsmith-desktop/plugins/
-git clone https://github.com/user/slopsmith-plugin-foo
-# Restart the app
+mkdir -p ~/Library/Application\ Support/slopsmith-desktop/plugins
+git clone https://github.com/user/slopsmith-plugin-foo \
+  ~/Library/Application\ Support/slopsmith-desktop/plugins/slopsmith-plugin-foo
+# or symlink — always use an absolute path to avoid a broken self-referencing symlink
+ln -s /absolute/path/to/slopsmith-plugin-foo \
+  ~/Library/Application\ Support/slopsmith-desktop/plugins/slopsmith-plugin-foo
 ```
+
+**Linux:**
+```bash
+mkdir -p ~/.config/slopsmith-desktop/plugins
+git clone https://github.com/user/slopsmith-plugin-foo \
+  ~/.config/slopsmith-desktop/plugins/slopsmith-plugin-foo
+```
+
+Restart the app after adding plugins.
 
 ## Reporting issues
 
