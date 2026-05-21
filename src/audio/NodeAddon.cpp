@@ -9,10 +9,18 @@
 #include <cstdio>
 #include <cerrno>
 #include <cmath>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 
 #include "AudioEngine.h"
 #include "VSTHost.h"
+
+// Forward declaration — defined alongside loadVstSandboxAware further down.
+// doShutdown (below) needs it to release any LoadVSTWorker / LoadPreset-
+// Worker blocked on a pending async load before the message thread stops.
+static void cancelAllPendingLoads();
 #include "VSTTrace.h"
 #include "NAMProcessor.h"
 #include "IRLoader.h"
@@ -20,8 +28,40 @@
 
 #include <juce_events/juce_events.h>
 
-static std::unique_ptr<AudioEngine> engine;
-static std::unique_ptr<VSTHost> vstHost;
+// engine / vstHost — shared_ptr (not unique_ptr) so worker threads can take
+// a stable snapshot that keeps the object alive for the duration of their
+// work, even if the message thread reassigns the global mid-operation. This
+// matters most for the async VST load: createPluginInstanceAsync's JUCE
+// continuation must not have VSTHost / its formatManager torn out from
+// under it mid-load.
+//
+// snapshotEngine() / snapshotVstHost() take the global under the matching
+// mutex and return a private copy. EVERY cross-thread access *should* go
+// through these — the message thread mutates the globals (Init, doShutdown)
+// while worker threads read them. As of this PR all the worker / async-load
+// paths (LoadVSTWorker, LoadNAMWorker, LoadIRWorker, LoadPresetWorker,
+// ScanPluginsWorker, doShutdown) are converted. The remaining ~100 direct
+// reads in the synchronous napi handlers (SetGain, GetLevels, …) still
+// carry the *pre-existing* raw-read-vs-reset race they had when these were
+// unique_ptrs; migrating them is tracked as a dedicated follow-up rather
+// than expanding this PR.
+static std::shared_ptr<AudioEngine> engine;
+static std::mutex engineMutex;
+
+static std::shared_ptr<AudioEngine> snapshotEngine()
+{
+    std::lock_guard<std::mutex> lock(engineMutex);
+    return engine;
+}
+
+static std::shared_ptr<VSTHost> vstHost;
+static std::mutex vstHostMutex;
+
+static std::shared_ptr<VSTHost> snapshotVstHost()
+{
+    std::lock_guard<std::mutex> lock(vstHostMutex);
+    return vstHost;
+}
 static std::thread juceMessageThread;
 static std::atomic<bool> juceRunning{false};
 static std::atomic<bool> alreadyShutDown{false};
@@ -116,8 +156,14 @@ static Napi::Value Init(const Napi::CallbackInfo& info)
 
     // Create engine on the JUCE message thread (or inline on macOS)
     dispatchOnMessageThread([]() {
-        engine = std::make_unique<AudioEngine>();
-        vstHost = std::make_unique<VSTHost>();
+        {
+            std::lock_guard<std::mutex> lock(engineMutex);
+            engine = std::make_shared<AudioEngine>();
+        }
+        {
+            std::lock_guard<std::mutex> lock(vstHostMutex);
+            vstHost = std::make_shared<VSTHost>();
+        }
 
         auto types = engine->getDeviceTypes();
         fprintf(stderr, "[audio-native] Init complete. Device types: %d\n", types.size());
@@ -150,11 +196,26 @@ static void doShutdown()
     bool expected = false;
     if (!alreadyShutDown.compare_exchange_strong(expected, true)) return;
 
-    if (juceRunning.load() || engine || vstHost)
+    // Release any LoadVSTWorker / LoadPresetWorker currently blocked on a
+    // pending async load. Without this they'd wait forever on the
+    // WaitableEvent — the createPluginInstanceAsync callback can't fire
+    // once the message thread is gone. Forward-declared above; the
+    // implementation lives near loadVstSandboxAware.
+    cancelAllPendingLoads();
+
+    if (juceRunning.load() || snapshotEngine() || snapshotVstHost())
     {
         dispatchOnMessageThread([]() {
-            if (engine) { engine->stopAudio(); engine.reset(); }
-            vstHost.reset();
+            if (auto liveEngine = snapshotEngine())
+                liveEngine->stopAudio();
+            {
+                std::lock_guard<std::mutex> lock(engineMutex);
+                engine.reset();
+            }
+            {
+                std::lock_guard<std::mutex> lock(vstHostMutex);
+                vstHost.reset();
+            }
         });
     }
 
@@ -1001,8 +1062,9 @@ public:
 
     void Execute() override
     {
-        if (!vstHost) return;
-        vstHost->scanDirectories(directories, [](float, const juce::String&) {});
+        auto host = snapshotVstHost();
+        if (!host) return;
+        host->scanDirectories(directories, [](float, const juce::String&) {});
     }
 
     void OnOK() override
@@ -1010,9 +1072,9 @@ public:
         auto env = Env();
         auto result = Napi::Array::New(env);
 
-        if (vstHost)
+        if (auto host = snapshotVstHost())
         {
-            auto plugins = vstHost->getKnownPlugins();
+            auto plugins = host->getKnownPlugins();
             for (int i = 0; i < plugins.size(); ++i)
             {
                 auto obj = Napi::Object::New(env);
@@ -1067,9 +1129,9 @@ static Napi::Value GetKnownPlugins(const Napi::CallbackInfo& info)
     auto env = info.Env();
     auto result = Napi::Array::New(env);
 
-    if (vstHost)
+    if (auto host = snapshotVstHost())
     {
-        auto plugins = vstHost->getKnownPlugins();
+        auto plugins = host->getKnownPlugins();
         for (int i = 0; i < plugins.size(); ++i)
         {
             auto obj = Napi::Object::New(env);
@@ -1089,15 +1151,17 @@ static Napi::Value GetKnownPlugins(const Napi::CallbackInfo& info)
 
 static Napi::Value SavePluginList(const Napi::CallbackInfo& info)
 {
-    if (vstHost && info.Length() > 0)
-        vstHost->savePluginList(juce::File(juce::String(info[0].As<Napi::String>().Utf8Value())));
+    if (info.Length() == 0) return info.Env().Undefined();
+    if (auto host = snapshotVstHost())
+        host->savePluginList(juce::File(juce::String(info[0].As<Napi::String>().Utf8Value())));
     return info.Env().Undefined();
 }
 
 static Napi::Value LoadPluginList(const Napi::CallbackInfo& info)
 {
-    if (vstHost && info.Length() > 0)
-        vstHost->loadPluginList(juce::File(juce::String(info[0].As<Napi::String>().Utf8Value())));
+    if (info.Length() == 0) return info.Env().Undefined();
+    if (auto host = snapshotVstHost())
+        host->loadPluginList(juce::File(juce::String(info[0].As<Napi::String>().Utf8Value())));
     return info.Env().Undefined();
 }
 
@@ -1124,16 +1188,56 @@ static Napi::Value SetCrashedPlugins(const Napi::CallbackInfo& info)
 
 // ── Signal Chain Management ──────────────────────────────────────────────────
 
+// Pending in-process loads: each LoadVSTWorker / LoadPresetWorker that's
+// currently blocked on `done->wait()` registers its event here. doShutdown
+// signals them all so the workers unblock and return a clean "cancelled"
+// error instead of hanging forever when the JUCE message thread is about
+// to be stopped (and any unfired callback would never arrive).
+static std::mutex pendingLoadsMutex;
+static std::set<std::shared_ptr<juce::WaitableEvent>> pendingLoads;
+
+static void registerPendingLoad(std::shared_ptr<juce::WaitableEvent> evt)
+{
+    std::lock_guard<std::mutex> lock(pendingLoadsMutex);
+    pendingLoads.insert(std::move(evt));
+}
+
+static void unregisterPendingLoad(const std::shared_ptr<juce::WaitableEvent>& evt)
+{
+    std::lock_guard<std::mutex> lock(pendingLoadsMutex);
+    pendingLoads.erase(evt);
+}
+
+static void cancelAllPendingLoads()
+{
+    std::lock_guard<std::mutex> lock(pendingLoadsMutex);
+    for (auto& evt : pendingLoads) evt->signal();
+    pendingLoads.clear();
+}
+
 // Load a VST3, routing it through the out-of-process sandbox when
 // shouldSandbox() says so (the filename pre-seed or the runtime crash
-// blocklist), otherwise loading it in-process on the JUCE message thread.
+// blocklist), otherwise loading it in-process. The in-process load uses
+// VSTHost::loadPluginAsync so the JUCE message thread keeps pumping during
+// the plugin's init — critical for plugins like AmpliTube that post WM_USER
+// / WM_TIMER messages to themselves while initialising. The sync
+// createPluginInstance would block the pump, those self-messages would
+// queue forever, and the plugin would end up half-wired (a pointer that
+// only gets written by a queued message stays null, and the editor crashes
+// on its first WindowProc dispatch — the AmpliTube failure signature).
+//
+// Threading: on !JUCE_MAC must be called from a libuv worker thread (NOT
+// the JS main thread, NOT the JUCE message thread) — the done->wait below
+// has to be on a thread that *isn't* the one running JUCE's pump or the
+// load can't complete. On JUCE_MAC the inline sync fallback is used and
+// the caller can be the Node/main thread (which is also JUCE's message
+// thread there); LoadVST does exactly that, while LoadPresetWorker still
+// hits this from a worker (a pre-existing macOS limitation).
 //
 // On a *required*-sandbox failure (the plugin matched shouldSandbox but the
 // sandbox couldn't spawn) this returns nullptr with `error` set and
 // `sandboxRequired` true, so the caller can choose how to surface it —
-// LoadVST throws to JS, LoadPreset just skips the slot. Used by both so a
-// crash-blocklisted plugin can never sneak back in-process via preset
-// restore.
+// LoadVSTWorker throws to JS, LoadPresetWorker just skips the slot.
 static std::unique_ptr<juce::AudioProcessor> loadVstSandboxAware(
     const juce::String& pluginPath, double sr, int bs,
     juce::String& error, bool& sandboxRequired)
@@ -1161,77 +1265,334 @@ static std::unique_ptr<juce::AudioProcessor> loadVstSandboxAware(
         return processor;
     }
 
-    // In-process JUCE load. Instantiate on the JUCE message thread for the
-    // COM-apartment reason documented in VSTHost::loadPlugin.
+   #if JUCE_MAC
+    // macOS has no separate JUCE message thread (see startJuceMessageThread /
+    // dispatchOnMessageThread): the JUCE MessageManager is bound to the
+    // Node/main thread, and dispatchOnMessageThread historically ran inline
+    // on the caller. A callAsync + done->wait pattern would queue a callback
+    // to a pump that may never run in this calling context.
     //
-    // dispatchOnMessageThread can return on its 15 s timeout while the lambda
-    // is still queued, so the lambda must not capture this (possibly unwound)
-    // stack frame by reference. Route the result through shared_ptrs that
-    // outlive both the caller and a late-running lambda.
-    auto instance = std::make_shared<std::unique_ptr<juce::AudioPluginInstance>>();
+    // Fall back to the sync loadPlugin, executed on whichever thread called
+    // in — the Node/main thread for LoadVST's JUCE_MAC branch (correct: that
+    // *is* the MessageManager thread on macOS), or a libuv worker thread for
+    // LoadPresetWorker (the pre-existing macOS constraint). Caveat: the
+    // existing dispatchOnMessageThread block on macOS already documents
+    // that "VST/AU plugin instantiation (which genuinely requires a message
+    // thread on macOS) is the one capability we give up until a proper
+    // libuv-based pump lands." LoadPresetWorker has called loadVstSandbox-
+    // Aware on a worker thread for ages under exactly the same constraint;
+    // moving LoadVST to AsyncWorker brings direct loads under the same
+    // (pre-existing) limitation. The AmpliTube-class self-message problem
+    // this PR targets is Windows-specific (Electron owns the OS main
+    // thread, forcing JUCE's MessageManager onto a background thread that
+    // createPluginInstance then blocks); macOS doesn't have that mismatch.
+    auto host = snapshotVstHost();
+    if (! host) { error = "vstHost not initialised"; return nullptr; }
+    juce::String err;
+    auto instance = host->loadPlugin(pluginPath, sr, bs, err);
+    if (! instance) error = err.isNotEmpty() ? err : juce::String("load failed");
+    return instance;
+   #else
+    // In-process: kick off createPluginInstanceAsync on the message thread,
+    // block *this* (libuv worker) thread on a WaitableEvent until the load
+    // callback fires. The message thread keeps pumping during the wait so
+    // the plugin's self-posted init messages dispatch and its state finishes
+    // wiring up before the editor is ever opened.
+    //
+    // All state passed across the thread hop is held by shared_ptr so it
+    // outlives the lambda even on an unexpected destructor / scope exit.
+    auto instance  = std::make_shared<std::unique_ptr<juce::AudioPluginInstance>>();
     auto loadError = std::make_shared<juce::String>();
-    dispatchOnMessageThread([pluginPath, sr, bs, instance, loadError]() {
-        if (vstHost)
-            *instance = vstHost->loadPlugin(pluginPath, sr, bs, *loadError);
-    });
+    auto done      = std::make_shared<juce::WaitableEvent>();
+
+    // Register BEFORE scheduling so a shutdown that lands between callAsync
+    // and the wait below can't miss us — cancelAllPendingLoads would
+    // otherwise see an empty set and the worker would block forever.
+    registerPendingLoad(done);
+
+    // Check alreadyShutDown after registering to catch the inverse race
+    // (shutdown ran before we registered): if it's already set, the
+    // shutdown won't see this event and we must bail ourselves.
+    if (alreadyShutDown.load(std::memory_order_acquire))
+    {
+        unregisterPendingLoad(done);
+        error = "shutdown in flight";
+        return nullptr;
+    }
+
+    // Snapshot a shared_ptr to vstHost so the async load and its inner
+    // continuation can keep VSTHost (and thus formatManager) alive even if
+    // shutdown resets the global mid-load. The inner callback captures the
+    // same hostKeeper, so JUCE retains it until createPluginInstanceAsync
+    // completes; once the callback destructs, the keeper drops, and if the
+    // global has been reset by then the VSTHost destructor runs safely
+    // (no work in flight). The snapshot itself goes through vstHostMutex
+    // so the shared_ptr copy can't race with shutdown's vstHost.reset().
+    auto hostKeeper = snapshotVstHost();
+
+    const bool scheduled = juce::MessageManager::callAsync(
+        [hostKeeper, pluginPath, sr, bs, instance, loadError, done]()
+        {
+            // Shutdown may have fired between callAsync queueing this
+            // lambda and the message thread picking it up. Bail before
+            // kicking off another in-flight createPluginInstanceAsync
+            // that the shutdown would otherwise have to wait on.
+            if (alreadyShutDown.load(std::memory_order_acquire))
+            {
+                *loadError = "shutdown in flight";
+                done->signal();
+                return;
+            }
+            if (! hostKeeper)
+            {
+                *loadError = "vstHost not initialised";
+                done->signal();
+                return;
+            }
+            hostKeeper->loadPluginAsync(
+                pluginPath, sr, bs,
+                [hostKeeper, instance, loadError, done]
+                (std::unique_ptr<juce::AudioPluginInstance> inst, juce::String err)
+                {
+                    *instance  = std::move(inst);
+                    *loadError = std::move(err);
+                    done->signal();
+                });
+        });
+
+    if (! scheduled)
+    {
+        // The message queue is gone (typically: shutdown in flight). The
+        // lambda will never run, so done would never signal — surface the
+        // failure rather than hanging the worker forever.
+        unregisterPendingLoad(done);
+        error = "message manager unavailable (shutdown?)";
+        return nullptr;
+    }
+
+    // No timeout: createPluginInstanceAsync is genuinely async (the message
+    // thread keeps pumping), so a slow first-run plugin (e.g. one doing a
+    // license check that exceeds 15 s) is allowed to take however long it
+    // takes. The old 15-second timeout in dispatchOnMessageThread could
+    // return early while the lambda was still running, then the lambda
+    // would construct a fully-initialised plugin only for it to immediately
+    // destruct because no one held a reference — running VST teardown on
+    // the message thread while the user had already moved on. That race is
+    // gone with this design.
+    //
+    // Tradeoff: this call holds a libuv threadpool worker for the duration
+    // of the plugin's init. Multiple concurrent hung loads could in theory
+    // starve other AsyncWorkers (fs / crypto). In practice plugin loads are
+    // user-driven and serialised (LoadPresetWorker loads slots one at a
+    // time), and a truly stuck load is bounded by app shutdown via
+    // cancelAllPendingLoads. A proper "fire-and-forget with a TSFN
+    // completion callback" model would eliminate the block entirely but
+    // requires a bigger API restructure than this PR's scope.
+    done->wait();
+    unregisterPendingLoad(done);
+
+    // Distinguish "shutdown cancelled us before the callback fired"
+    // (instance null AND error empty) from a normal load failure (instance
+    // null with error set) and a normal success.
+    if (! *instance && loadError->isEmpty())
+    {
+        error = "load cancelled (shutdown)";
+        return nullptr;
+    }
     error = *loadError;
     return std::move(*instance);
+   #endif
 }
+
+// AsyncWorker wrapper for LoadVST. Execute() runs on a libuv worker thread,
+// so loadVstSandboxAware can block-wait on the async load without freezing
+// the JS main thread or deadlocking the JUCE message thread.
+class LoadVSTWorker : public Napi::AsyncWorker
+{
+public:
+    LoadVSTWorker(Napi::Env env, Napi::Promise::Deferred deferred, std::string path)
+        : Napi::AsyncWorker(env)
+        , deferred_(deferred)
+        , pluginPath_(std::move(path)) {}
+
+    void Execute() override
+    {
+        // Snapshot engine + vstHost through their mutex-protected helpers so
+        // shutdown's reset on the message thread can't race the worker's
+        // dereferences below. The shared_ptr locals keep both objects alive
+        // for the duration of this worker even if the globals get reset
+        // mid-load. The atomic alreadyShutDown gate is the early-out: once
+        // it's set, the dispatched reset is on its way and there's no point
+        // continuing.
+        if (alreadyShutDown.load(std::memory_order_acquire))
+        {
+            error_ = "shutdown in flight";
+            return;
+        }
+        auto engineKeeper = snapshotEngine();
+        auto hostSnap     = snapshotVstHost();
+        if (!engineKeeper || !hostSnap)
+        {
+            error_ = "engine not initialised";
+            return;
+        }
+
+        const auto sr = engineKeeper->getCurrentSampleRate();
+        const auto bs = engineKeeper->getCurrentBlockSize();
+        const auto path = juce::String(pluginPath_);
+        VST_TRACE("LoadVSTWorker: path='%s' sr=%.0f bs=%d",
+                  pluginPath_.c_str(), sr, bs);
+
+        bool sandboxRequired = false;
+        juce::String err;
+        auto processor = loadVstSandboxAware(path, sr, bs, err, sandboxRequired);
+
+        if (sandboxRequired && !processor)
+        {
+            // The plugin's on the denylist and the sandbox couldn't spawn —
+            // falling back to in-process is what crashed the addon to begin
+            // with. Surface as a JS exception (handled in OnOK).
+            fprintf(stderr, "[LoadVST] Failed: %s\n", err.toRawUTF8());
+            error_ = err;
+            sandboxFailed_ = true;
+            return;
+        }
+
+        if (!processor)
+        {
+            fprintf(stderr, "[LoadVST] Failed: %s\n", err.toRawUTF8());
+            error_ = err;
+            return;
+        }
+
+        // Engine may have been torn down while we were waiting on the async
+        // load. The shared_ptr captures keep `processor` alive; just don't
+        // touch a freed engine. The processor destructs cleanly when this
+        // scope exits.
+        //
+        // Gate on alreadyShutDown (atomic, properly synchronised) before the
+        // raw engine/vstHost pointer reads — once that flag is set, the
+        // dispatched reset of engine/vstHost is on its way and any use of
+        // the pointers from this worker thread is racy. The atomic check is
+        // the authoritative "should I still be touching engine?" signal.
+        if (alreadyShutDown.load(std::memory_order_acquire))
+        {
+            error_ = "engine torn down during load";
+            return;
+        }
+        // Re-snapshot the engine — the original engineKeeper might have
+        // outlived a reset on the message thread, but the AudioEngine
+        // we're about to mutate must be the still-installed one. If the
+        // global has been reset, the local keeps the old engine alive but
+        // we shouldn't be adding slots to it any more.
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine || !snapshotVstHost())
+        {
+            error_ = "engine torn down during load";
+            return;
+        }
+
+        auto name = processor->getName();
+        slotId_ = liveEngine->getSignalChain().addProcessor(
+            std::move(processor),
+            ProcessorSlot::Type::VST,
+            name,
+            path);
+    }
+
+    void OnOK() override
+    {
+        if (sandboxFailed_)
+        {
+            // Match the prior LoadVST throw-on-required-sandbox-failure
+            // behaviour so renderers' try/catch keeps working.
+            deferred_.Reject(
+                Napi::Error::New(Env(), error_.toStdString()).Value());
+            return;
+        }
+        deferred_.Resolve(Napi::Number::New(Env(), slotId_));
+    }
+
+    void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
+
+private:
+    Napi::Promise::Deferred deferred_;
+    std::string pluginPath_;
+    int slotId_ = -1;
+    bool sandboxFailed_ = false;
+    juce::String error_;
+};
 
 static Napi::Value LoadVST(const Napi::CallbackInfo& info)
 {
     auto env = info.Env();
-    if (!engine || !vstHost || info.Length() < 1)
-        return Napi::Number::New(env, -1);
+    auto deferred = Napi::Promise::Deferred::New(env);
 
-    auto pluginPath = info[0].As<Napi::String>().Utf8Value();
-    int slotId = -1;
-
-    juce::String error;
-    std::unique_ptr<juce::AudioProcessor> processor;
-    auto sr = engine->getCurrentSampleRate();
-    auto bs = engine->getCurrentBlockSize();
-    VST_TRACE("LoadVST: path='%s' sr=%.0f bs=%d", pluginPath.c_str(), sr, bs);
-
-    // Load via the shared sandbox-aware path: shouldSandbox() routes denylist
-    // / crash-blocklist plugins out-of-process, everything else in-process.
-    bool sandboxRequired = false;
-    processor = loadVstSandboxAware(juce::String(pluginPath), sr, bs,
-                                    error, sandboxRequired);
-
-    // If the plugin is on the denylist, sandboxing is *required* — falling
-    // back to in-process is what crashed the addon to begin with. Surface the
-    // failure to the caller by throwing.
-    if (sandboxRequired && !processor)
+    if (!snapshotEngine() || !snapshotVstHost() || info.Length() < 1)
     {
-        // Mirror the in-process load's stderr format so a JS test harness or
-        // Electron renderer sees the same diagnostics regardless of path.
-        fprintf(stderr, "[LoadVST] Failed: %s\n", error.toRawUTF8());
-        // Throw a Napi::Error so the JS caller gets the actual sandbox-spawn
-        // diagnostic instead of an opaque -1. Renderers must `try/catch
-        // addon.loadVST(...)` to handle this path. Invariant: this `return`
-        // MUST happen before any engine->getSignalChain() mutation — the
-        // throw marks the napi call as having thrown, so any chain mutation
-        // between here and return would leave a dangling slot while JS sees
-        // an exception. The Napi::Number::New only satisfies the signature.
-        Napi::Error::New(env, error.toStdString())
-            .ThrowAsJavaScriptException();
-        return Napi::Number::New(env, -1);
+        deferred.Resolve(Napi::Number::New(env, -1));
+        return deferred.Promise();
     }
 
+    auto pluginPath = info[0].As<Napi::String>().Utf8Value();
+
+   #if JUCE_MAC
+    // On macOS the JUCE MessageManager is bound to the Node/main thread.
+    // Running this as an AsyncWorker would call vstHost->loadPlugin on a
+    // libuv worker thread, which JUCE documents as unsupported for VST/AU
+    // instantiation. Do the load synchronously on the Node/main thread
+    // (same as the pre-PR LoadVST) and return a resolved Promise to match
+    // the new signature. Pays the foreground-block cost the AsyncWorker
+    // path was supposed to avoid, but that's the existing macOS reality —
+    // dispatchOnMessageThread already runs inline there. The async-load
+    // motivation (AmpliTube blocking the background JUCE message thread
+    // under Electron) is a Windows-only problem.
+    // Snapshot once for the whole load so the same AudioEngine is used for
+    // the sr/bs reads and the addProcessor mutation, even if shutdown
+    // resets the global mid-call.
+    auto liveEngine = snapshotEngine();
+    if (! liveEngine)
+    {
+        deferred.Resolve(Napi::Number::New(env, -1));
+        return deferred.Promise();
+    }
+    juce::String error;
+    bool sandboxRequired = false;
+    auto processor = loadVstSandboxAware(
+        juce::String(pluginPath),
+        liveEngine->getCurrentSampleRate(),
+        liveEngine->getCurrentBlockSize(),
+        error, sandboxRequired);
+
+    if (sandboxRequired && !processor)
+    {
+        fprintf(stderr, "[LoadVST] Failed: %s\n", error.toRawUTF8());
+        deferred.Reject(
+            Napi::Error::New(env, error.toStdString()).Value());
+        return deferred.Promise();
+    }
+
+    int slotId = -1;
     if (processor)
     {
         auto name = processor->getName();
-        slotId = engine->getSignalChain().addProcessor(
+        slotId = liveEngine->getSignalChain().addProcessor(
             std::move(processor),
             ProcessorSlot::Type::VST,
             name,
             juce::String(pluginPath));
     }
     else
+    {
         fprintf(stderr, "[LoadVST] Failed: %s\n", error.toRawUTF8());
-
-    return Napi::Number::New(env, slotId);
+    }
+    deferred.Resolve(Napi::Number::New(env, slotId));
+    return deferred.Promise();
+   #else
+    auto* worker = new LoadVSTWorker(env, deferred, std::move(pluginPath));
+    worker->Queue();
+    return deferred.Promise();
+   #endif
 }
 
 class LoadNAMWorker : public Napi::AsyncWorker
@@ -1242,13 +1603,14 @@ public:
 
     void Execute() override
     {
-        if (!engine) { slotId_ = -1; return; }
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) { slotId_ = -1; return; }
 
         auto processor = std::make_unique<NAMProcessor>();
         if (processor->loadModel(juce::File(juce::String(modelPath_))))
         {
             auto name = processor->getModelName();
-            slotId_ = engine->getSignalChain().addProcessor(
+            slotId_ = liveEngine->getSignalChain().addProcessor(
                 std::move(processor),
                 ProcessorSlot::Type::NAM,
                 "NAM: " + name,
@@ -1270,7 +1632,7 @@ static Napi::Value LoadNAMModel(const Napi::CallbackInfo& info)
     auto env = info.Env();
     auto deferred = Napi::Promise::Deferred::New(env);
 
-    if (!engine || info.Length() < 1) {
+    if (!snapshotEngine() || info.Length() < 1) {
         deferred.Resolve(Napi::Number::New(env, -1));
         return deferred.Promise();
     }
@@ -1289,15 +1651,18 @@ public:
 
     void Execute() override
     {
-        if (!engine) { slotId_ = -1; return; }
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) { slotId_ = -1; return; }
 
+        const auto sr = liveEngine->getCurrentSampleRate();
+        const auto bs = liveEngine->getCurrentBlockSize();
         auto processor = std::make_unique<IRLoader>();
-        processor->setPlayConfigDetails(2, 2, engine->getCurrentSampleRate(), engine->getCurrentBlockSize());
-        processor->prepareToPlay(engine->getCurrentSampleRate(), engine->getCurrentBlockSize());
+        processor->setPlayConfigDetails(2, 2, sr, bs);
+        processor->prepareToPlay(sr, bs);
         if (processor->loadIR(juce::File(juce::String(irPath_))))
         {
             auto name = processor->getIRName();
-            slotId_ = engine->getSignalChain().addProcessor(
+            slotId_ = liveEngine->getSignalChain().addProcessor(
                     std::move(processor),
                     ProcessorSlot::Type::IR,
                     "IR: " + name,
@@ -1319,7 +1684,7 @@ static Napi::Value LoadIR(const Napi::CallbackInfo& info)
     auto env = info.Env();
     auto deferred = Napi::Promise::Deferred::New(env);
 
-    if (!engine || info.Length() < 1) {
+    if (!snapshotEngine() || info.Length() < 1) {
         deferred.Resolve(Napi::Number::New(env, -1));
         return deferred.Promise();
     }
@@ -1650,7 +2015,8 @@ public:
 
     void Execute() override
     {
-        if (!engine) { success_ = false; error_ = "No engine"; return; }
+        auto liveEngine = snapshotEngine();
+        if (!liveEngine) { success_ = false; error_ = "No engine"; return; }
 
         auto parsed = juce::JSON::parse(juce::String(presetJson_));
         if (!parsed.isObject()) { success_ = false; error_ = "Invalid JSON"; return; }
@@ -1663,10 +2029,10 @@ public:
         if (!chainArray) { success_ = false; error_ = "No chain array"; return; }
 
         // Clear existing chain
-        engine->getSignalChain().clear();
+        liveEngine->getSignalChain().clear();
 
-        double sr = engine->getCurrentSampleRate();
-        int bs = engine->getCurrentBlockSize();
+        double sr = liveEngine->getCurrentSampleRate();
+        int bs = liveEngine->getCurrentBlockSize();
 
         for (auto& slotVar : *chainArray)
         {
@@ -1681,7 +2047,7 @@ public:
 
             std::unique_ptr<juce::AudioProcessor> processor;
 
-            if (type == (int)ProcessorSlot::Type::VST && vstHost)
+            if (type == (int)ProcessorSlot::Type::VST && snapshotVstHost())
             {
                 // Sandbox-aware load: a crash-blocklisted plugin restored
                 // from a preset must still go out-of-process, otherwise the
@@ -1720,13 +2086,13 @@ public:
             }
             else continue;
 
-            int slotId = engine->getSignalChain().addProcessor(
+            int slotId = liveEngine->getSignalChain().addProcessor(
                 std::move(processor),
                 (ProcessorSlot::Type)type,
                 name, path);
 
             if (bypassed && slotId >= 0)
-                engine->getSignalChain().setBypass(slotId, true);
+                liveEngine->getSignalChain().setBypass(slotId, true);
 
             // Restore processor state
             if (stateB64.isNotEmpty() && slotId >= 0)
@@ -1734,7 +2100,7 @@ public:
                 juce::MemoryBlock state;
                 if (state.fromBase64Encoding(stateB64))
                 {
-                    auto* slot = const_cast<ProcessorSlot*>(engine->getSignalChain().getSlot(slotId));
+                    auto* slot = const_cast<ProcessorSlot*>(liveEngine->getSignalChain().getSlot(slotId));
                     if (slot) slot->setState(state);
                 }
             }
