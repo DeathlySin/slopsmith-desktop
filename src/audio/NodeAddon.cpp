@@ -1295,11 +1295,16 @@ static Napi::Value IsBackingPlaying(const Napi::CallbackInfo& info)
 
 static Napi::Value SetBackingSpeed(const Napi::CallbackInfo& info)
 {
-    if (engine && info.Length() > 0)
+    auto env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber())
     {
-        engine->setBackingSpeed(info[0].As<Napi::Number>().DoubleValue());
+        Napi::TypeError::New(env, "setBackingSpeed(speed) requires a number")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
     }
-    return info.Env().Undefined();
+    if (engine)
+        engine->setBackingSpeed(info[0].As<Napi::Number>().DoubleValue());
+    return env.Undefined();
 }
 
 // ── Presets ───────────────────────────────────────────────────────────────────
