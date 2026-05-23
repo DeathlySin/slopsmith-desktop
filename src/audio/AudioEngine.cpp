@@ -514,8 +514,8 @@ void AudioEngine::setBackingSpeed(double speed)
         return;
     }
 
-    backingSpeed.store(speed);
     const juce::ScopedLock sl(backingLock);
+    backingSpeed.store(speed);
     if (backingResampler)
     {
         backingResampler->setResamplingRatio(speed);
@@ -566,8 +566,6 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     {
         backingResampler->prepareToPlay(bs, sr);
     }
-    else if (backingTransport)
-        backingTransport->prepareToPlay(bs, sr);
 }
 
 void AudioEngine::audioDeviceStopped()
