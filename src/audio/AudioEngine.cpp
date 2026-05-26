@@ -887,8 +887,13 @@ void AudioEngine::audioDeviceIOCallbackWithContext(
 
             // Report the song position when audible at the speakers:
             // subtract the stretcher's output latency converted to input-time seconds.
+            // sr can transiently be 0 if the device-setup error path zeroes it
+            // (AudioEngine.cpp:457) while a callback is still being drained —
+            // fall back to the uncompensated position rather than divide by zero.
             const double sr = currentSampleRate.load(std::memory_order_relaxed);
-            const double latencyInputSec = (backingStretchLatencySamples.load(std::memory_order_relaxed) * rate) / sr;
+            const double latencyInputSec = (sr > 0.0)
+                ? (backingStretchLatencySamples.load(std::memory_order_relaxed) * rate) / sr
+                : 0.0;
             cachedBackingPosition.store(juce::jmax(0.0, backingTransport->getCurrentPosition() - latencyInputSec));
 
             // Sync the flag if transport stopped at EOF
